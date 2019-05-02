@@ -544,7 +544,6 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 
 	// initialize new device list
 	var devices object.VirtualDeviceList
-	deviceSpecs := []types.BaseVirtualDeviceConfigSpec{}
 
 	// DISK COPY
 
@@ -594,7 +593,6 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 
 			dstdisk = fmt.Sprintf("%s/%s-%s.vmdk", dstf, machine.Name, diskSpec.DiskLabel)
 			srcfile := srcdisk.Backing.(types.BaseVirtualDeviceFileBackingInfo)
-			klog.V(4).Infof("*** [DEBUG] found source disk %s", srcfile.GetVirtualDeviceFileBackingInfo().FileName)
 
 			// copy happens here
 			klog.V(4).Infof("[DEBUG] Cloning template disk to %s", dstdisk)
@@ -607,18 +605,12 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 			// attach disk to VM
 			disk := devices.CreateDisk(controller, ds.Reference(), ds.Path(fmt.Sprintf("%s/%s-%s.vmdk", machine.Name, machine.Name, diskSpec.DiskLabel)))
 			devices = append(devices, disk)
-
-			diskSpec := &types.VirtualDeviceConfigSpec{}
-			diskSpec.Operation = types.VirtualDeviceConfigSpecOperationEdit
-			diskSpec.Device = disk
-			deviceSpecs = append(deviceSpecs, diskSpec)
 		}
 	}
 
-	klog.V(4).Infof("[DEBUG] Adding NICs")
 	// Add networking
 	// Add new nics based on the user info
-	nicid := int32(-100)
+	klog.V(4).Infof("[DEBUG] Adding NICs")
 	for _, network := range machineConfig.MachineSpec.Networks {
 		netRef, err := s.finder.Network(ctx, network.NetworkName)
 		if err != nil {
@@ -636,45 +628,21 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 			return err
 		}
 		devices = append(devices, netdev)
-
-		nic := types.VirtualVmxnet3{}
-		nic.Key = nicid
-		nic.Backing, err = netRef.EthernetCardBackingInfo(ctx)
-		if err != nil {
-			return err
-		}
-		nicSpec := &types.VirtualDeviceConfigSpec{}
-		nicSpec.Operation = types.VirtualDeviceConfigSpecOperationAdd
-		nicSpec.Device = &nic
-		deviceSpecs = append(deviceSpecs, nicSpec)
 	}
 
 	// Add a serial port
+	klog.V(4).Infof("[DEBUG] Adding SIO controller")
 	c := &types.VirtualSIOController{}
 	c.Key = devices.NewKey()
 	devices = append(devices, c)
-	sioSpec := &types.VirtualDeviceConfigSpec{}
-	sioSpec.Operation = types.VirtualDeviceConfigSpecOperationAdd
-	sioSpec.Device = c
-	deviceSpecs = append(deviceSpecs, sioSpec)
 
+	klog.V(4).Infof("[DEBUG] Adding serial port")
 	portSpec, err := devices.CreateSerialPort()
 	if err != nil {
 		klog.V(4).Infof("[DEBUG] Failed to add serial port: %s", err.Error())
 		return err
 	}
 	devices = append(devices, portSpec)
-	portSpec.Key = devices.NewKey()
-	serialSpec := &types.VirtualDeviceConfigSpec{}
-	serialSpec.Operation = types.VirtualDeviceConfigSpecOperationAdd
-	serialSpec.Device = portSpec
-	deviceSpecs = append(deviceSpecs, serialSpec)
-
-	for i, s := range deviceSpecs {
-		d := s.GetVirtualDeviceConfigSpec()
-		klog.Infof("[DEBUG] device spec %d = %#v", i, *d)
-		klog.Infof("		device = %#v", *(d.Device.GetVirtualDevice()))
-	}
 
 	deviceChange, err := devices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
 	if err != nil {
@@ -682,7 +650,6 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 	}
 
 	spec.DeviceChange = deviceChange
-	//spec.DeviceChange = deviceSpecs
 
 	// get current hostsystem from source vm
 	ch, err := src.HostSystem(ctx)
