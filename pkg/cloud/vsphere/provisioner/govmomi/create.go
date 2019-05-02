@@ -413,17 +413,7 @@ func (pv *Provisioner) cloneVirtualMachineOnVCenter(s *SessionContext, cluster *
 // cloneVirtualMachineOnESX clones the template to a virtual machine.
 func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clusterv1.Cluster, machine *clusterv1.Machine) error {
 	klog.V(4).Infof("Starting the clone process on standalone ESX")
-	// Fetch the user-data for the cloud-init first, so that we can fail fast before even trying to connect to VC
-	userData, err := pv.getCloudInitUserData(cluster, machine, false)
-	if err != nil {
-		// err returned by the getCloudInitUserData would be of type RequeueAfterError in case kubeadm is not ready yet
-		return err
-	}
-	metaData, err := pv.getCloudInitMetaData(cluster, machine)
-	if err != nil {
-		// err returned by the getCloudInitUserData would be of type RequeueAfterError in case kubeadm is not ready yet
-		return err
-	}
+
 	ctx, cancel := context.WithCancel(*s.context)
 	defer cancel()
 
@@ -433,18 +423,14 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 	}
 	klog.V(4).Infof("[cloneVirtualMachineOnESX]: Preparing clone spec for VM %s", machine.Name)
 
-	dc, err := s.finder.DatacenterOrDefault(ctx, machineConfig.MachineSpec.Datacenter)
+	dc, err := s.finder.DefaultDatacenter(ctx)
+	//dc, err := s.finder.DatacenterOrDefault(ctx, machineConfig.MachineSpec.Datacenter)
 	if err != nil {
 		return err
 	}
 	s.finder.SetDatacenter(dc)
 
 	folders, err := dc.Folders(ctx)
-	if err != nil {
-		return err
-	}
-
-	ds, err := s.finder.DatastoreOrDefault(ctx, machineConfig.MachineSpec.Datastore)
 	if err != nil {
 		return err
 	}
@@ -465,6 +451,62 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 	}
 
 	spec := &types.VirtualMachineConfigSpec{}
+	var devices object.VirtualDeviceList
+
+	if err := pv.addMachineBase(s, cluster, machine, machineConfig, spec, vmProps); err != nil {
+		return err
+	}
+
+	if devices, err = pv.copyDisks(ctx, s, machine, machineConfig, devices, vmProps); err != nil {
+		return err
+	}
+
+	if devices, err = pv.addNetworking(ctx, s, machineConfig, devices); err != nil {
+		return err
+	}
+
+	if devices, err = pv.addSerialPort(ctx, devices, vmProps); err != nil {
+		return err
+	}
+
+	deviceChange, err := devices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
+	if err != nil {
+		return err
+	}
+
+	spec.DeviceChange = deviceChange
+
+	// get current hostsystem from source vm
+	ch, err := src.HostSystem(ctx)
+	if err != nil {
+		return err
+	}
+
+	pv.eventRecorder.Eventf(machine, corev1.EventTypeNormal, "Creating", "Creating Machine %v", machine.Name)
+
+	task, err := folders.VmFolder.CreateVM(ctx, *spec, pool, ch)
+	if err != nil {
+		klog.Infof("[DEBUG] VmFolder.CreateVM() FAILED: %s", err.Error())
+		return err
+	}
+
+	return pv.setTaskRef(machine, task.Reference().Value)
+
+}
+
+func (pv *Provisioner) addMachineBase(s *SessionContext, cluster *clusterv1.Cluster, machine *clusterv1.Machine, machineConfig *vsphereconfigv1.VsphereMachineProviderConfig, spec *types.VirtualMachineConfigSpec, vmProps *mo.VirtualMachine) error {
+	// Fetch the user-data for the cloud-init first, so that we can fail fast before even trying to connect to VC
+	userData, err := pv.getCloudInitUserData(cluster, machine, false)
+	if err != nil {
+		// err returned by the getCloudInitUserData would be of type RequeueAfterError in case kubeadm is not ready yet
+		return err
+	}
+	metaData, err := pv.getCloudInitMetaData(cluster, machine)
+	if err != nil {
+		// err returned by the getCloudInitUserData would be of type RequeueAfterError in case kubeadm is not ready yet
+		return err
+	}
+
 	diskUUIDEnabled := true
 	spec.Flags = &types.VirtualMachineFlagInfo{
 		DiskUuidEnabled: &diskUUIDEnabled,
@@ -542,10 +584,19 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 		VmPathName: fmt.Sprintf("[%s]", machineConfig.MachineSpec.Datastore),
 	}
 
-	// initialize new device list
-	var devices object.VirtualDeviceList
+	return nil
+}
 
-	// DISK COPY
+func (pv *Provisioner) copyDisks(ctx context.Context, s *SessionContext, machine *clusterv1.Machine, machineConfig *vsphereconfigv1.VsphereMachineProviderConfig, devices object.VirtualDeviceList, vmProps *mo.VirtualMachine) (object.VirtualDeviceList, error) {
+	ds, err := s.finder.DatastoreOrDefault(ctx, machineConfig.MachineSpec.Datastore)
+	if err != nil {
+		return devices, err
+	}
+	dc, err := s.finder.DefaultDatacenter(ctx)
+	if err != nil {
+		return devices, err
+	}
+	s.finder.SetDatacenter(dc)
 
 	// Create datastore directory for our VM
 	dstf := fmt.Sprintf("[%s] %s", machineConfig.MachineSpec.Datastore, machine.Name)
@@ -556,7 +607,7 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 			soapFault := soap.ToSoapFault(err)
 			// Exit with error only if it's not EEXIST
 			if _, ok := soapFault.VimFault().(types.FileAlreadyExists); !ok {
-				return err
+				return devices, err
 			}
 		}
 	}
@@ -567,13 +618,13 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 
 	scsi, err := devices.CreateSCSIController("")
 	if err != nil {
-		return err
+		return devices, err
 	}
 
 	devices = append(devices, scsi)
 	controller, err := devices.FindDiskController(devices.Name(scsi))
 	if err != nil {
-		return err
+		return devices, err
 	}
 
 	var dstdisk string
@@ -586,7 +637,7 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 			if srcdisk.DeviceInfo.GetDescription().Label == diskSpec.DiskLabel {
 				newSize := diskSpec.DiskSizeGB
 				if srcdisk.CapacityInBytes > vsphereutils.GiBToByte(newSize) {
-					return errors.New("Disk size provided should be more than actual disk size of the template")
+					return devices, errors.New("Disk size provided should be more than actual disk size of the template")
 				}
 				srcdisk.CapacityInBytes = vsphereutils.GiBToByte(newSize)
 			}
@@ -599,7 +650,7 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 			cp := m.Copy
 			if err := cp(ctx, srcfile.GetVirtualDeviceFileBackingInfo().FileName, dstdisk); err != nil {
 				klog.V(4).Infof("[DEBUG] Copying vmdk, src(%s), dst(%s)", srcfile.GetVirtualDeviceFileBackingInfo().FileName, dstdisk)
-				return err
+				return devices, err
 			}
 
 			// attach disk to VM
@@ -608,66 +659,73 @@ func (pv *Provisioner) cloneVirtualMachineOnESX(s *SessionContext, cluster *clus
 		}
 	}
 
-	// Add networking
-	// Add new nics based on the user info
+	return devices, nil
+}
+
+func (pv *Provisioner) addNetworking(ctx context.Context, s *SessionContext, machineConfig *vsphereconfigv1.VsphereMachineProviderConfig, devices object.VirtualDeviceList) (object.VirtualDeviceList, error) {
 	klog.V(4).Infof("[DEBUG] Adding NICs")
 	for _, network := range machineConfig.MachineSpec.Networks {
 		netRef, err := s.finder.Network(ctx, network.NetworkName)
 		if err != nil {
-			return err
+			return devices, err
 		}
 
 		backing, err := netRef.EthernetCardBackingInfo(ctx)
 		if err != nil {
-			return err
+			return devices, err
 		}
 
-		// TODO(frapposelli): hardcoded to vmxnet3 as any modern kernel should have drivers for it, maybe think of a different strategy here
 		netdev, err := object.EthernetCardTypes().CreateEthernetCard("vmxnet3", backing)
 		if err != nil {
-			return err
+			return devices, err
 		}
 		devices = append(devices, netdev)
 	}
 
-	// Add a serial port
+	return devices, nil
+}
+
+func (pv *Provisioner) addSerialPort(ctx context.Context, devices object.VirtualDeviceList, vmProps *mo.VirtualMachine) (object.VirtualDeviceList, error) {
+	// Add SIO Controller
 	klog.V(4).Infof("[DEBUG] Adding SIO controller")
-	c := &types.VirtualSIOController{}
-	c.Key = devices.NewKey()
-	devices = append(devices, c)
+	l := object.VirtualDeviceList(vmProps.Config.Hardware.Device)
+	controllers := l.SelectByType((*types.VirtualSIOController)(nil))
 
-	klog.V(4).Infof("[DEBUG] Adding serial port")
-	portSpec, err := devices.CreateSerialPort()
-	if err != nil {
-		klog.V(4).Infof("[DEBUG] Failed to add serial port: %s", err.Error())
-		return err
-	}
-	devices = append(devices, portSpec)
-
-	deviceChange, err := devices.ConfigSpec(types.VirtualDeviceConfigSpecOperationAdd)
-	if err != nil {
-		return err
+	if len(controllers) == 0 {
+		// Add a serial port
+		klog.V(4).Infof("[DEBUG] Adding SIO controller")
+		c := &types.VirtualSIOController{}
+		c.Key = devices.NewKey()
+		devices = append(devices, c)
 	}
 
-	spec.DeviceChange = deviceChange
-
-	// get current hostsystem from source vm
-	ch, err := src.HostSystem(ctx)
-	if err != nil {
-		return err
+	for _, d := range controllers {
+		c := d.(*types.VirtualSIOController)
+		c.Key = devices.NewKey()
+		devices = append(devices, c)
 	}
-	klog.Infof("[DEBUG] VmFolder.CreateVM() ***")
-	// reconfigure disks as needed
-	pv.eventRecorder.Eventf(machine, corev1.EventTypeNormal, "Creating", "Creating Machine %v", machine.Name)
-	task, err := folders.VmFolder.CreateVM(ctx, *spec, pool, ch)
-	if err != nil {
-		klog.Infof("[DEBUG] VmFolder.CreateVM() FAILED: %s", err.Error())
-		return err
+
+	// Add serial port
+	ports := l.SelectByType((*types.VirtualSerialPort)(nil))
+
+	if len(ports) == 0 {
+		klog.V(4).Infof("[DEBUG] Adding serial port")
+		portSpec, err := devices.CreateSerialPort()
+		if err != nil {
+			klog.V(4).Infof("[DEBUG] Failed to add serial port: %s", err.Error())
+			return devices, err
+		}
+		portSpec.Key = devices.NewKey()
+		devices = append(devices, portSpec)
 	}
-	klog.Infof("[DEBUG] task for created vm = %s", task.Reference().Value)
 
-	return pv.setTaskRef(machine, task.Reference().Value)
+	for _, d := range ports {
+		p := d.(*types.VirtualSerialPort)
+		p.Key = devices.NewKey()
+		devices = append(devices, p)
+	}
 
+	return devices, nil
 }
 
 // Properties is a convenience method that wraps fetching the
