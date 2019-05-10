@@ -161,18 +161,9 @@ func (pv *Provisioner) verifyAndUpdateTask(s *SessionContext, machine *clusterv1
 		return pv.setTaskRef(machine, "")
 	case types.TaskInfoStateError:
 		klog.Infof("[DEBUG] task error condition, description = %s", taskmo.Info.DescriptionId)
-		if taskmo.Info.DescriptionId == "VirtualMachine.clone" {
+		// If the machine was created via the ESXi "cloning", the description id will likely be "Folder.createVm"
+		if taskmo.Info.DescriptionId == "VirtualMachine.clone" || taskmo.Info.DescriptionId == "Folder.createVm" {
 			pv.eventRecorder.Eventf(machine, corev1.EventTypeNormal, "Failed", "Creation failed for Machine %v", machine.Name)
-			// Clear the reference to the failed task so that the next reconcile loop can re-create it
-			return pv.setTaskRef(machine, "")
-		}
-		if taskmo.Info.DescriptionId == "Folder.createVm" {
-			pv.eventRecorder.Eventf(machine, corev1.EventTypeNormal, "Failed", "Creation failed for Machine %v", machine.Name)
-			klog.Infof("[DEBUG] task error condition, deleting vm")
-			if err = pv.deleteVMESX(s, ctx, machine, taskmoref); err != nil {
-				klog.Infof("[DEBUG] task error condition, deleting vm failed: %s", err.Error())
-				pv.eventRecorder.Eventf(machine, corev1.EventTypeNormal, "Failed", "Cleaning up failed creation also failed for Machine %v", machine.Name)
-			}
 			// Clear the reference to the failed task so that the next reconcile loop can re-create it
 			return pv.setTaskRef(machine, "")
 		}
